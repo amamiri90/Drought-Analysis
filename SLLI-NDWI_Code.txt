@@ -1,0 +1,589 @@
+from __future__ import annotations
+
+import argparse
+import logging
+import warnings
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+log = logging.getLogger("slli_ndwi")
+EPS = 1e-6
+NDWI_DATE_CANDIDATES = ["image_date", "image_da", "Date", "date"]
+NDWI_VALUE_CANDIDATES = ["ndwi_mean", "ndwi_median", "ndwi", "NDWI_MEAN", "NDWI_MEDIAN"]
+
+
+# --------------------------------------------------------------------------
+# Generic helpers
+# --------------------------------------------------------------------------
+def month_end_index(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    return idx.to_period("M").to_timestamp(how="end").normalize()
+
+
+def monthly_range(start: str, end: str) -> pd.DatetimeIndex:
+    return pd.period_range(start, end, freq="M").to_timestamp(how="end").normalize()
+
+
+def load_monthly_excel(path: Path, date_col: str = "Date") -> pd.DataFrame:
+    df = pd.read_excel(path)
+    if date_col not in df.columns:
+        raise ValueError(f"'{date_col}' not found in {path}. Available: {df.columns.tolist()}")
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df.dropna(subset=[date_col]).set_index(date_col).sort_index()
+    df.index = month_end_index(df.index)
+    return df.groupby(level=0).mean(numeric_only=True)
+
+
+def find_column(df: pd.DataFrame, keyword: str) -> str:
+    hits = [c for c in df.columns if keyword.lower() in str(c).lower()]
+    if not hits:
+        raise ValueError(f"No column containing '{keyword}'. Available: {df.columns.tolist()}")
+    return hits[0]
+
+
+def first_existing(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    return next((c for c in candidates if c in df.columns), None)
+
+
+def year_mask(index: pd.DatetimeIndex, period: Optional[Tuple[int, int]]) -> np.ndarray:
+    if period is None:
+        return np.ones(len(index), dtype=bool)
+    return (index.year >= period[0]) & (index.year <= period[1])
+
+
+def drought_class(x: float) -> str:
+    if pd.isna(x):
+        return "No data"
+    for thr, lab in [(-2.0, "Extreme drought"), (-1.5, "Severe drought"), (-1.0, "Moderate drought")]:
+        if x <= thr:
+            return lab
+    if x < 1.0:
+        return "Near normal"
+    if x < 1.5:
+        return "Moderately wet"
+    if x < 2.0:
+        return "Very wet"
+    return "Extremely wet"
+
+
+# --------------------------------------------------------------------------
+# Statistics helpers
+# --------------------------------------------------------------------------
+def _pair(x: pd.Series, y: pd.Series) -> pd.DataFrame:
+    return pd.concat([x, y], axis=1, keys=["x", "y"]).dropna()
+
+
+def corr_with_neff(x: pd.Series, y: pd.Series, method: str = "pearson") -> Dict[str, float]:
+    """
+    Correlation with (a) the naive p-value and (b) a p-value using an effective
+    sample size n_eff = n (1 - r1x r1y) / (1 + r1x r1y) (Bretherton et al. 1999),
+    because monthly index series are strongly autocorrelated.
+    x and y must be on a complete monthly index (NaN for gaps) so lag-1 is in months.
+    """
+    c = _pair(x, y)
+    n = len(c)
+    nan = dict(r=np.nan, p_naive=np.nan, n=n, n_eff=np.nan, p_eff=np.nan)
+    if n < 5 or c["x"].nunique() < 2 or c["y"].nunique() < 2:
+        return nan
+    fn = stats.pearsonr if method == "pearson" else stats.spearmanr
+    r, p = fn(c["x"], c["y"])
+    r1x = x.autocorr(1) if x.notna().sum() > 3 else 0.0
+    r1y = y.autocorr(1) if y.notna().sum() > 3 else 0.0
+    r1x = 0.0 if pd.isna(r1x) else r1x
+    r1y = 0.0 if pd.isna(r1y) else r1y
+    prod = r1x * r1y
+    n_eff = float(np.clip(n * (1 - prod) / (1 + prod), 3, n)) if prod > 0 else float(n)
+    if abs(r) >= 1:
+        p_eff = 0.0
+    else:
+        t = r * np.sqrt((n_eff - 2) / (1 - r ** 2))
+        p_eff = float(2 * stats.t.sf(abs(t), n_eff - 2))
+    return dict(r=float(r), p_naive=float(p), n=n, n_eff=n_eff, p_eff=p_eff)
+
+
+def mae_rmse(x: pd.Series, y: pd.Series) -> Tuple[float, float]:
+    c = _pair(x, y)
+    if len(c) < 2:
+        return np.nan, np.nan
+    d = c["x"] - c["y"]
+    return float(d.abs().mean()), float(np.sqrt((d ** 2).mean()))
+
+
+def binary_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    t, p = np.asarray(y_true, bool), np.asarray(y_pred, bool)
+    tp, fp, fn, tn = int((t & p).sum()), int((~t & p).sum()), int((t & ~p).sum()), int((~t & ~p).sum())
+    n = tp + fp + fn + tn
+    po = (tp + tn) / n if n else np.nan
+    pe = ((tp + fp) * (tp + fn) + (fn + tn) * (fp + tn)) / n ** 2 if n else np.nan
+    return dict(
+        N=n, TP=tp, FP=fp, FN=fn, TN=tn, Accuracy=po,
+        Kappa=(po - pe) / (1 - pe) if n and pe < 1 else np.nan,   # undefined if one class only
+        Precision=tp / (tp + fp) if tp + fp else np.nan,
+        Recall=tp / (tp + fn) if tp + fn else np.nan,
+        F1=2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else np.nan,
+    )
+
+
+def event_agreement(ref: pd.Series, test: pd.Series, threshold: float) -> Dict[str, float]:
+    c = _pair(ref, test)
+    if len(c) < 3:
+        return binary_metrics(np.array([], bool), np.array([], bool))
+    return binary_metrics((c["x"] <= threshold).values, (c["y"] <= threshold).values)
+
+
+# --------------------------------------------------------------------------
+# Merging lake-level sources
+# --------------------------------------------------------------------------
+def fit_map(cand: pd.Series, ref: pd.Series, method: str, min_overlap: int):
+    """Linear map candidate -> reference datum. Returns (slope, intercept, n, resid_sd) or None."""
+    c = _pair(cand, ref)
+    if len(c) < min_overlap:
+        return None
+    if method == "ols":
+        slope, intercept = np.polyfit(c["x"], c["y"], 1)
+    elif method == "mean_std":      # variance-preserving alternative to OLS
+        slope = c["y"].std(ddof=1) / c["x"].std(ddof=1)
+        intercept = c["y"].mean() - slope * c["x"].mean()
+    else:
+        raise ValueError(method)
+    resid = (slope * c["x"] + intercept) - c["y"]
+    return dict(slope=float(slope), intercept=float(intercept), n=len(c),
+                resid_sd=float(resid.std(ddof=2)))
+
+
+def apply_map(s: pd.Series, m: Optional[dict]) -> pd.Series:
+    if m is None:
+        return pd.Series(np.nan, index=s.index)       # source unusable: do NOT use uncorrected levels
+    return s * m["slope"] + m["intercept"]
+
+
+def build_best_series(obs, sat, dah, method: str, min_overlap: int):
+    m_s, m_d = fit_map(sat, obs, method, min_overlap), fit_map(dah, obs, method, min_overlap)
+    s_c, d_c = apply_map(sat, m_s), apply_map(dah, m_d)
+
+    w_s = 1 / m_s["resid_sd"] ** 2 if m_s else 0.0           # inverse-variance weights
+    w_d = 1 / m_d["resid_sd"] ** 2 if m_d else 0.0
+    wsum = w_s + w_d
+    w_s, w_d = (w_s / wsum, w_d / wsum) if wsum > 0 else (0.0, 0.0)
+
+    best = obs.copy()
+    source = pd.Series(np.where(obs.notna(), "observed", ""), index=obs.index, dtype=object)
+
+    both = best.isna() & s_c.notna() & d_c.notna()
+    best[both] = w_s * s_c[both] + w_d * d_c[both]
+    source[both] = "blend"
+    only_s = best.isna() & s_c.notna()
+    best[only_s], source[only_s] = s_c[only_s], "satellite"
+    only_d = best.isna() & d_c.notna()
+    best[only_d], source[only_d] = d_c[only_d], "dahiti"
+    source[best.isna()] = "missing"
+
+    info = dict(sat=m_s, dahiti=m_d, w_sat=w_s, w_dahiti=w_d, source_counts=source.value_counts().to_dict())
+    return best, source, info
+
+
+# --------------------------------------------------------------------------
+# Standardisation
+# --------------------------------------------------------------------------
+def empirical_standardize(series: pd.Series, calib: Optional[Tuple[int, int]] = None,
+                          min_obs: int = 10) -> pd.Series:
+    """
+    Month-wise empirical CDF -> standard normal. Hazen plotting position with
+    mid-ranks, p = (rank - 0.5) / n for values inside the calibration sample;
+    values outside it are placed with p = (k + 0.5) / (n + 1) (k = # smaller).
+    Both are symmetric, so mean(SLLI) ~ 0.
+
+    NOTE: the smallest attainable value is Phi^-1(0.5/n): with n=10 that is -1.64,
+    with n=22 it is -2.0. Drought categories are therefore sample-size limited.
+    """
+    out = pd.Series(np.nan, index=series.index)
+    for m in range(1, 13):
+        chunk = series[series.index.month == m]
+        cal = np.sort(chunk[year_mask(chunk.index, calib)].dropna().values)
+        n = len(cal)
+        if n < min_obs:
+            continue
+        v = chunk.dropna()
+        less = np.searchsorted(cal, v.values, side="left")
+        eq = np.searchsorted(cal, v.values, side="right") - less
+        p = np.where(eq > 0, (less + 0.5 * eq) / n, (less + 0.5) / (n + 1))
+        out.loc[v.index] = stats.norm.ppf(np.clip(p, EPS, 1 - EPS))
+    return out
+
+
+PARAMETRIC = {"normal": stats.norm, "gamma": stats.gamma,
+              "lognormal": stats.lognorm, "weibull": stats.weibull_min}
+
+
+def parametric_standardize(series: pd.Series, dist_name: str, calib=None,
+                           min_obs: int = 10) -> Tuple[pd.Series, List[dict]]:
+    """Month-wise parametric CDF -> standard normal, with KS/AIC diagnostics."""
+    dist = PARAMETRIC[dist_name]
+    out = pd.Series(np.nan, index=series.index)
+    diag = []
+    for m in range(1, 13):
+        chunk = series[series.index.month == m]
+        cal = chunk[year_mask(chunk.index, calib)].dropna().values.astype(float)
+        if len(cal) < max(min_obs, 8):
+            continue
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                params = dist.fit(cal)
+                ll = float(np.sum(dist.logpdf(cal, *params)))
+                ks = stats.kstest(cal, dist.cdf, args=params)
+                v = chunk.dropna()
+                p = dist.cdf(v.values, *params)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("%s month %02d fit failed: %s", dist_name, m, exc)
+            continue
+        if not np.all(np.isfinite(p)):
+            continue
+        out.loc[v.index] = stats.norm.ppf(np.clip(p, EPS, 1 - EPS))
+        diag.append(dict(Distribution=dist_name, Month=m, n=len(cal), n_params=len(params),
+                         loglik=ll, AIC=2 * len(params) - 2 * ll if np.isfinite(ll) else np.nan,
+                         KS_D=ks.statistic, KS_p_naive=ks.pvalue))
+    return out, diag
+
+
+def compute_variants(series: pd.Series, min_obs: int):
+    variants = {"empirical": empirical_standardize(series, min_obs=min_obs)}
+    diag = []
+    for name in PARAMETRIC:
+        variants[name], d = parametric_standardize(series, name, min_obs=min_obs)
+        diag += d
+    return variants, pd.DataFrame(diag)
+
+
+# --------------------------------------------------------------------------
+# Events and robustness
+# --------------------------------------------------------------------------
+def drought_events(series: pd.Series, threshold: float = -1.0, min_duration: int = 1) -> pd.DataFrame:
+    """Runs of consecutive months with index <= threshold. NaN months end a run."""
+    events, run = [], []
+
+    def flush():
+        if len(run) >= min_duration:
+            vals = np.array([v for _, v in run])
+            events.append(dict(start=run[0][0], end=run[-1][0], duration_months=len(run),
+                               min_index=vals.min(), mean_index=vals.mean(),
+                               severity=float(-vals[vals < 0].sum())))
+
+    for dt, val in series.items():
+        if pd.notna(val) and val <= threshold:
+            run.append((dt, val))
+        else:
+            flush()
+            run = []
+    flush()
+    return pd.DataFrame(events)
+
+
+def compare_variants(variants: Dict[str, pd.Series], threshold: float):
+    names = list(variants)
+    rows = []
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            c = _pair(variants[a], variants[b])
+            ea = event_agreement(variants[a], variants[b], threshold)
+            mae, rm = mae_rmse(variants[a], variants[b])
+            rows.append(dict(method_a=a, method_b=b, N=len(c),
+                             pearson_r=corr_with_neff(variants[a], variants[b])["r"],
+                             spearman_rho=corr_with_neff(variants[a], variants[b], "spearman")["r"],
+                             mae=mae, rmse=rm, kappa=ea["Kappa"], f1=ea["F1"], accuracy=ea["Accuracy"]))
+    mat = pd.DataFrame(1.0, index=names, columns=names)
+    for a in names:
+        for b in names:
+            if a != b:
+                mat.loc[a, b] = corr_with_neff(variants[a], variants[b])["r"]
+    return pd.DataFrame(rows), mat
+
+
+def threshold_sensitivity(z: pd.Series, thresholds: List[float]) -> pd.DataFrame:
+    rows = []
+    n_valid = z.notna().sum()
+    for t in thresholds:
+        ev = drought_events(z, t)
+        rows.append(dict(threshold=t, event_count=len(ev),
+                         months_below=int((z <= t).sum()),
+                         pct_months_below=100 * (z <= t).sum() / n_valid if n_valid else np.nan,
+                         pct_expected_if_standard_normal=100 * stats.norm.cdf(t),
+                         mean_duration_months=ev["duration_months"].mean() if len(ev) else np.nan,
+                         mean_severity=ev["severity"].mean() if len(ev) else np.nan))
+    return pd.DataFrame(rows)
+
+
+def split_sample_test(best: pd.Series, split_year: int, min_obs: int, threshold: float) -> pd.DataFrame:
+    """
+    Calibrate the empirical CDF on one half of the record and apply it to the other half;
+    compare with the full-record index on the held-out half. mean_z_heldout far from 0
+    means the lake level is non-stationary (trend/regulation), not just 'noisy'.
+    """
+    y0, y1 = int(best.index.year.min()), int(best.index.year.max())
+    full = empirical_standardize(best, min_obs=min_obs)
+    rows = []
+    for name, cal, held in [(f"calibrate {y0}-{split_year}", (y0, split_year), (split_year + 1, y1)),
+                            (f"calibrate {split_year + 1}-{y1}", (split_year + 1, y1), (y0, split_year))]:
+        z = empirical_standardize(best, calib=cal, min_obs=min_obs)
+        sel = year_mask(best.index, held)
+        zh, fh = z[sel], full[sel]
+        c = _pair(zh, fh)
+        mae, rm = mae_rmse(zh, fh)
+        ea = event_agreement(fh, zh, threshold)
+        rows.append(dict(calibration=name, evaluated_on=f"{held[0]}-{held[1]}", N=len(c),
+                         mean_z_heldout=float(zh.mean()), std_z_heldout=float(zh.std()),
+                         pct_below_threshold=float(100 * (zh <= threshold).sum() / zh.notna().sum()),
+                         pearson_r_vs_full=corr_with_neff(zh, fh)["r"], mae_vs_full=mae, rmse_vs_full=rm,
+                         kappa_vs_full=ea["Kappa"], f1_vs_full=ea["F1"]))
+    return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------
+# NDWI
+# --------------------------------------------------------------------------
+def prepare_monthly_ndwi(df: pd.DataFrame, dayfirst: bool) -> Tuple[pd.DataFrame, str, str]:
+    dcol, vcol = first_existing(df, NDWI_DATE_CANDIDATES), first_existing(df, NDWI_VALUE_CANDIDATES)
+    if dcol is None or vcol is None:
+        raise ValueError(f"NDWI date/value column not found. Available: {df.columns.tolist()}")
+    d = pd.to_datetime(df[dcol], dayfirst=dayfirst, errors="coerce")
+    s = pd.Series(df.loc[d.notna(), vcol].astype(float).values, index=month_end_index(pd.DatetimeIndex(d.dropna())))
+    g = s.groupby(level=0)
+    return pd.DataFrame({"NDWI_Monthly": g.median(), "N_scenes": g.size()}).sort_index(), vcol, dcol
+
+
+def lag_table(slli: pd.Series, sndwi: pd.Series, max_lag: int) -> pd.DataFrame:
+    """
+    sndwi must be on the full monthly index. lag k > 0: SLLI(t) is paired with SNDWI(t-k)
+    (NDWI leads); k < 0: NDWI lags the lake level.
+    """
+    rows = []
+    for k in range(-max_lag, max_lag + 1):
+        rows.append(dict(lag_months=k, **corr_with_neff(slli, sndwi.shift(k))))
+    return pd.DataFrame(rows).rename(columns={"r": "pearson_r"})
+
+
+# --------------------------------------------------------------------------
+# Plots
+# --------------------------------------------------------------------------
+def _threshold_lines(ax):
+    ax.axhline(0, color="gray", ls="--", lw=0.8)
+    for t, ls in [(-1.0, "--"), (-1.5, ":"), (-2.0, "-.")]:
+        ax.axhline(t, color="red", ls=ls, lw=0.8)
+
+
+def plot_timeseries(res, variants, ndwi_tab, title, path, dpi):
+    n = 4 if ndwi_tab is not None else 3
+    fig, axes = plt.subplots(n, 1, figsize=(16, 3.6 * n))
+    ax = axes[0]
+    for col, kw in [("Best_Level_m", dict(lw=1.4, color="black")), ("Observed_Level_m", dict(lw=0.9, alpha=0.8)),
+                    ("Satellite_Level_m", dict(lw=0.9, alpha=0.6)), ("DAHITI_Level_m", dict(lw=0.9, alpha=0.6))]:
+        ax.plot(res.index, res[col], label=col.replace("_m", "").replace("_", " "), **kw)
+    ax.set(title=f"{title} - lake level", ylabel="Level (m)")
+    axes[1].plot(res.index, variants["empirical"], color="black", lw=1.2, label="SLLI (empirical)")
+    _threshold_lines(axes[1])
+    axes[1].set(title="Primary SLLI", ylabel="SLLI")
+    for name, z in variants.items():
+        axes[2].plot(z.index, z, lw=1.0, alpha=0.85, label=name)
+    _threshold_lines(axes[2])
+    axes[2].set(title="SLLI - distribution comparison", ylabel="Index")
+    if ndwi_tab is not None:
+        axes[3].plot(ndwi_tab.index, ndwi_tab["SNDWI"], color="green", lw=1.1, label="SNDWI")
+        _threshold_lines(axes[3])
+        axes[3].set(title="Standardised NDWI", ylabel="SNDWI", xlabel="Date")
+    for a in axes:
+        a.legend(loc="best")
+        a.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_heatmap(mat, path, dpi):
+    fig, ax = plt.subplots(figsize=(7, 5.5))
+    im = ax.imshow(mat.values.astype(float), cmap="RdBu_r", vmin=-1, vmax=1)
+    fig.colorbar(im, label="Pearson r")
+    ax.set_xticks(range(len(mat)), mat.columns, rotation=45, ha="right")
+    ax.set_yticks(range(len(mat)), mat.index)
+    for i in range(len(mat)):
+        for j in range(len(mat)):
+            ax.text(j, i, f"{mat.iloc[i, j]:.2f}", ha="center", va="center", fontsize=9)
+    ax.set_title("Pairwise correlation between SLLI variants")
+    fig.tight_layout()
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_thresholds(df, path, dpi):
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.plot(df["threshold"], df["pct_months_below"], "o-", label="% months below (observed)")
+    ax.plot(df["threshold"], df["pct_expected_if_standard_normal"], "s--", label="% expected for N(0,1)")
+    ax.set(xlabel="Threshold", ylabel="% of months", title="Threshold sensitivity")
+    ax.grid(alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--lake", required=True, help="Lake name as used in file names, e.g. Iznik")
+    p.add_argument("--data-dir", default="data")
+    p.add_argument("--output-dir", default="results")
+    p.add_argument("--obs-file", default="Observed_{lake}_Lake.xlsx")
+    p.add_argument("--sat-file", default="Satellite_{lake}.xlsx")
+    p.add_argument("--dahiti-file", default="Dahiti_{lake}_MA.xlsx")
+    p.add_argument("--ndwi-file", default="{lake}_NDWI_Stats.xlsx")
+    p.add_argument("--date-col", default="Date")
+    p.add_argument("--start", default="1993-01")
+    p.add_argument("--end", default="2024-12")
+    p.add_argument("--bias-method", choices=["ols", "mean_std"], default="ols",
+                   help="ols: regression (shrinks variance); mean_std: variance-preserving scaling")
+    p.add_argument("--threshold", type=float, default=-1.0)
+    p.add_argument("--max-lag", type=int, default=12)
+    p.add_argument("--min-month-obs", type=int, default=10,
+                   help="Minimum values per calendar month to standardise (original script: 4)")
+    p.add_argument("--min-month-obs-ndwi", type=int, default=4,
+                   help="Minimum monthly NDWI values per calendar month (short satellite records). "
+                        "Small n limits how extreme SNDWI can get: lowest attainable = Phi^-1(0.5/n)")
+    p.add_argument("--min-overlap", type=int, default=12)
+    p.add_argument("--split-year", type=int, default=2008)
+    p.add_argument("--ndwi-dayfirst", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--dpi", type=int, default=300)
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    a = parse_args(argv)
+    lake, key, data = a.lake, a.lake.lower(), Path(a.data_dir)
+    out = Path(a.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    idx = monthly_range(a.start, a.end)
+
+    frames = {}
+    for name, tpl in [("obs", a.obs_file), ("sat", a.sat_file), ("dah", a.dahiti_file)]:
+        df = load_monthly_excel(data / tpl.format(lake=lake), a.date_col)
+        frames[name] = df[find_column(df, key)].reindex(idx)
+    obs, sat, dah = frames["obs"], frames["sat"], frames["dah"]
+
+    best, source, info = build_best_series(obs, sat, dah, a.bias_method, a.min_overlap)
+    log.info("Sources used: %s", info["source_counts"])
+    for nm in ("sat", "dahiti"):
+        m = info[nm]
+        log.info("%s map: %s", nm, "UNUSABLE (overlap < %d)" % a.min_overlap if m is None else
+                 f"y = {m['slope']:.3f}x + {m['intercept']:.3f}, n={m['n']}, resid SD={m['resid_sd']:.3f} m")
+
+    variants, fit_diag = compute_variants(best, a.min_month_obs)
+    slli = variants["empirical"]
+    n_min = int(best.groupby(best.index.month).count().min())
+    log.info("Min values per calendar month: %d -> lowest attainable SLLI = %.2f",
+             n_min, stats.norm.ppf(0.5 / n_min) if n_min else np.nan)
+
+    events = drought_events(slli, a.threshold)
+    pair_df, corr_mat = compare_variants(variants, a.threshold)
+    thr_df = threshold_sensitivity(slli, [-0.5, -0.8, -1.0, -1.2, -1.5, -2.0])
+    split_df = split_sample_test(best, a.split_year, a.min_month_obs, a.threshold)
+
+    agree_rows = []
+    for name, z in variants.items():
+        if name == "empirical":
+            continue
+        ea = event_agreement(slli, z, a.threshold)
+        mae, rm = mae_rmse(slli, z)
+        pr, sr = corr_with_neff(slli, z), corr_with_neff(slli, z, "spearman")
+        agree_rows.append(dict(method=name, N=pr["n"], pearson_r=pr["r"], spearman_rho=sr["r"], mae=mae,
+                               rmse=rm, kappa=ea["Kappa"], accuracy=ea["Accuracy"], precision=ea["Precision"],
+                               recall=ea["Recall"], f1=ea["F1"], events_ref=len(events),
+                               events_test=len(drought_events(z, a.threshold))))
+    agree_df = pd.DataFrame(agree_rows)
+
+    res = pd.DataFrame(index=idx)
+    res.index.name = "Date"
+    res["Observed_Level_m"], res["Satellite_Level_m"], res["DAHITI_Level_m"] = obs, sat, dah
+    res["Best_Level_m"], res["Best_Source"] = best, source
+    for name, z in variants.items():
+        res[f"SLLI_{name}"] = z
+    res["SLLI_empirical_class"] = res["SLLI_empirical"].apply(drought_class)
+
+    summary = {"Lake": lake, "Bias_method": a.bias_method, "Min_values_per_month": n_min,
+               "Empirical_event_count": len(events), "Empirical_min_SLLI": float(slli.min()),
+               "Satellite_weight": info["w_sat"], "DAHITI_weight": info["w_dahiti"]}
+    for nm in ("sat", "dahiti"):
+        m = info[nm] or {}
+        summary.update({f"{nm}_overlap_n": m.get("n", 0), f"{nm}_slope": m.get("slope", np.nan),
+                        f"{nm}_resid_sd_m": m.get("resid_sd", np.nan)})
+    summary.update({f"Source_{k}": v for k, v in info["source_counts"].items()})
+
+    # ---- NDWI (optional) ---------------------------------------------------
+    ndwi_tab, lag_df = None, pd.DataFrame()
+    ndwi_path = data / a.ndwi_file.format(lake=lake)
+    if ndwi_path.exists():
+        ndwi_tab, vcol, dcol = prepare_monthly_ndwi(pd.read_excel(ndwi_path), a.ndwi_dayfirst)
+        log.info("NDWI: date col '%s', value col '%s', %d months with scenes", dcol, vcol, len(ndwi_tab))
+        # SNDWI on the FULL monthly grid so that .shift(lag) means "lag in months", not "rows".
+        ndwi_full = ndwi_tab["NDWI_Monthly"].reindex(monthly_range(
+            min(ndwi_tab.index.min(), idx[0]).strftime("%Y-%m"), max(ndwi_tab.index.max(), idx[-1]).strftime("%Y-%m")))
+        sndwi_full = empirical_standardize(ndwi_full, min_obs=a.min_month_obs_ndwi)
+        cnt = ndwi_full.groupby(ndwi_full.index.month).count()
+        log.info("NDWI values per calendar month: min=%d, max=%d -> lowest attainable SNDWI = %.2f",
+                 cnt.min(), cnt.max(), stats.norm.ppf(0.5 / max(cnt.min(), 1)))
+        ndwi_tab["SNDWI"] = sndwi_full.reindex(ndwi_tab.index)
+        ndwi_tab["Drought_Class_SNDWI"] = ndwi_tab["SNDWI"].apply(drought_class)
+        ndwi_tab.index.name = "Date"
+        sndwi = sndwi_full.reindex(idx)
+
+        pe, sp = corr_with_neff(slli, sndwi), corr_with_neff(slli, sndwi, "spearman")
+        ag = event_agreement(slli, sndwi, a.threshold)
+        lag_df = lag_table(slli, sndwi, a.max_lag)
+        if lag_df["pearson_r"].notna().any():
+            b = lag_df.loc[lag_df["pearson_r"].abs().idxmax()]
+        else:
+            b = pd.Series({"lag_months": np.nan, "pearson_r": np.nan, "p_eff": np.nan})
+        summary.update({"SLLI_SNDWI_pearson_r": pe["r"], "SLLI_SNDWI_p_naive": pe["p_naive"],
+                        "SLLI_SNDWI_p_effective": pe["p_eff"], "SLLI_SNDWI_N": pe["n"],
+                        "SLLI_SNDWI_N_effective": pe["n_eff"], "SLLI_SNDWI_spearman_rho": sp["r"],
+                        "Best_lag_months": b["lag_months"], "Best_lag_r": b["pearson_r"],
+                        "Best_lag_p_effective_UNADJUSTED_for_lag_search": b["p_eff"],
+                        **{f"SLLI_vs_SNDWI_{k}": v for k, v in ag.items()}})
+        log.info("SLLI vs SNDWI: r=%.3f, n=%d, n_eff=%.1f, p_naive=%.2e, p_eff=%.3f",
+                 pe["r"], pe["n"], pe["n_eff"], pe["p_naive"], pe["p_eff"])
+    else:
+        log.warning("NDWI file not found (%s) - skipping NDWI validation", ndwi_path)
+
+    # ---- Export ------------------------------------------------------------
+    xlsx = out / f"{lake}_SLLI_Results.xlsx"
+    with pd.ExcelWriter(xlsx, engine="openpyxl") as w:
+        res.to_excel(w, sheet_name="SLLI_All_Methods")
+        pd.DataFrame([summary]).T.rename(columns={0: "value"}).to_excel(w, sheet_name="Summary")
+        pair_df.to_excel(w, sheet_name="Pairwise_Comparison", index=False)
+        corr_mat.to_excel(w, sheet_name="Pearson_Matrix")
+        agree_df.to_excel(w, sheet_name="Method_Agreement", index=False)
+        fit_diag.to_excel(w, sheet_name="Parametric_Fit_Diagnostics", index=False)
+        thr_df.to_excel(w, sheet_name="Threshold_Sensitivity", index=False)
+        split_df.to_excel(w, sheet_name="Split_Sample_Test", index=False)
+        events.to_excel(w, sheet_name="Empirical_Events", index=False)
+        if ndwi_tab is not None:
+            ndwi_tab.to_excel(w, sheet_name="SNDWI_Result")
+            lag_df.to_excel(w, sheet_name="SLLI_NDWI_Lags", index=False)
+    log.info("Saved %s", xlsx)
+
+    stem = out / f"{lake}_SLLI"
+    plot_timeseries(res, variants, ndwi_tab, f"Lake {lake}", f"{stem}_Plots.png", a.dpi)
+    plot_heatmap(corr_mat, f"{stem}_corr_heatmap.png", a.dpi)
+    plot_thresholds(thr_df, f"{stem}_threshold_sensitivity.png", a.dpi)
+    log.info("Done.")
+
+
+if __name__ == "__main__":
+    main()

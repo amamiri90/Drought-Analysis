@@ -1,0 +1,381 @@
+from __future__ import annotations
+
+import argparse
+import logging
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy import stats
+from scipy.special import gamma as gamma_fn
+
+log = logging.getLogger("spi_spei")
+EPS = 1e-6  # probability clipping (limits |index| to ~4.75)
+
+
+# --------------------------------------------------------------------------
+# Data handling
+# --------------------------------------------------------------------------
+def month_end_index(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """Normalise any timestamps to month-end midnight (pandas-version safe)."""
+    return idx.to_period("M").to_timestamp(how="end").normalize()
+
+
+def load_monthly_csv(path: Path, value_col: str, date_col: str = "Date") -> pd.Series:
+    df = pd.read_csv(path, sep=None, engine="python")
+    for c in (date_col, value_col):
+        if c not in df.columns:
+            raise ValueError(f"Column '{c}' not in {path}. Found: {list(df.columns)}")
+    dates = pd.to_datetime(df[date_col], errors="coerce")
+    ok = dates.notna()
+    s = pd.Series(df.loc[ok, value_col].astype(float).values,
+                  index=month_end_index(pd.DatetimeIndex(dates[ok])))
+    s = s.groupby(level=0).mean().sort_index()
+    full = pd.period_range(s.index[0], s.index[-1], freq="M").to_timestamp(how="end").normalize()
+    n_gap = len(full) - len(s)
+    if n_gap:
+        log.warning("%s: %d missing months (kept as NaN, not interpolated)", path.name, n_gap)
+    return s.reindex(full)
+
+
+def rolling_sum(series: pd.Series, scale: int) -> pd.Series:
+    """Right-aligned rolling sum; any NaN inside the window gives NaN."""
+    return series.rolling(window=scale, min_periods=scale).sum()
+
+
+def calib_mask(index: pd.DatetimeIndex, calib: Optional[Tuple[int, int]]) -> np.ndarray:
+    if calib is None:
+        return np.ones(len(index), dtype=bool)
+    return (index.year >= calib[0]) & (index.year <= calib[1])
+
+
+# --------------------------------------------------------------------------
+# SPI (gamma)
+# --------------------------------------------------------------------------
+def _thom_gamma(x: np.ndarray) -> Optional[Tuple[float, float]]:
+    """Thom (1958) approximation of the gamma ML estimators (shape, scale)."""
+    xm = x.mean()
+    A = np.log(xm) - np.log(x).mean()
+    if not np.isfinite(A) or A <= 0:
+        return None
+    a = (1 + np.sqrt(1 + 4 * A / 3)) / (4 * A)
+    return a, xm / a
+
+
+def _ks_mc_pvalue(x: np.ndarray, a: float, b: float, n_boot: int,
+                  rng: np.random.Generator) -> float:
+    """Parametric-bootstrap (Lilliefors-type) p-value for the gamma KS test."""
+    d_obs = stats.kstest(x, stats.gamma(a, scale=b).cdf).statistic
+    hits, done = 0, 0
+    for _ in range(n_boot):
+        xs = rng.gamma(a, b, size=len(x))
+        fit = _thom_gamma(xs)
+        if fit is None:
+            continue
+        d = stats.kstest(xs, stats.gamma(fit[0], scale=fit[1]).cdf).statistic
+        hits += d >= d_obs
+        done += 1
+    return (hits + 1) / (done + 1) if done else np.nan
+
+
+def _spi_one_month(chunk: pd.Series, cal: np.ndarray, ks_alpha: float,
+                   ks_boot: int, rng) -> Tuple[pd.Series, dict]:
+    out = pd.Series(np.nan, index=chunk.index)
+    diag = dict(n_fit=0, q_zero=np.nan, shape=np.nan, scale=np.nan,
+                KS_D=np.nan, KS_p_naive=np.nan, KS_p_MC=np.nan, KS_pass=False)
+    fit_data = chunk[cal].dropna()
+    nz = fit_data[fit_data > 0].values
+    if len(nz) < 10:
+        return out, diag
+    q = float((fit_data == 0).mean())
+    params = _thom_gamma(nz)
+    if params is None:
+        return out, diag
+    a, b = params
+    ks = stats.kstest(nz, stats.gamma(a, scale=b).cdf)
+    p_mc = _ks_mc_pvalue(nz, a, b, ks_boot, rng) if ks_boot > 0 else np.nan
+    p_use = p_mc if np.isfinite(p_mc) else ks.pvalue
+    diag.update(n_fit=len(fit_data), q_zero=q, shape=a, scale=b, KS_D=ks.statistic,
+                KS_p_naive=ks.pvalue, KS_p_MC=p_mc, KS_pass=bool(p_use >= ks_alpha))
+
+    valid = chunk.dropna()
+    v = valid.values
+    p = np.where(v <= 0, q, q + (1 - q) * stats.gamma.cdf(v, a, scale=b))
+    out.loc[valid.index] = stats.norm.ppf(np.clip(p, EPS, 1 - EPS))
+    return out, diag
+
+
+def compute_spi(precip: pd.Series, timescales: List[int], calib=None,
+                ks_alpha: float = 0.05, ks_boot: int = 500, seed: int = 0):
+    rng = np.random.default_rng(seed)
+    cols, diag_rows = {}, []
+    for sc in timescales:
+        acc = rolling_sum(precip, sc)
+        spi = pd.Series(np.nan, index=acc.index)
+        for m in range(1, 13):
+            sel = acc.index.month == m
+            chunk = acc[sel]
+            z, d = _spi_one_month(chunk, calib_mask(chunk.index, calib), ks_alpha, ks_boot, rng)
+            spi.loc[chunk.index] = z.values
+            diag_rows.append(dict(Timescale=sc, Month=m, **d))
+        cols[f"SPI-{sc}"] = spi
+    return pd.DataFrame(cols), pd.DataFrame(diag_rows)
+
+
+# --------------------------------------------------------------------------
+# SPEI (3-parameter log-logistic, PWM)
+# --------------------------------------------------------------------------
+def fit_loglogistic_pwm(d: np.ndarray) -> Optional[Tuple[float, float, float]]:
+    """
+    Three-parameter log-logistic (alpha=scale, beta=shape, gamma=location) via
+    PWM, Vicente-Serrano et al. (2010), eqs. 4-8:
+        w_s = (1/N) * sum_i (1 - F_i)^s * D_i,   F_i = (i - 0.35) / N,  D sorted ascending
+    """
+    x = np.sort(np.asarray(d, dtype=float))
+    n = len(x)
+    F = (np.arange(1, n + 1) - 0.35) / n
+    w0, w1, w2 = (np.mean((1 - F) ** s * x) for s in (0, 1, 2))
+    denom = 6 * w1 - w0 - 6 * w2
+    if denom == 0:
+        return None
+    beta = (2 * w1 - w0) / denom
+    if not np.isfinite(beta) or beta <= 1:      # Gamma(1 - 1/beta) needs beta > 1
+        return None
+    g = gamma_fn(1 + 1 / beta) * gamma_fn(1 - 1 / beta)
+    alpha = (w0 - 2 * w1) * beta / g
+    loc = w0 - alpha * g
+    if not np.isfinite(alpha) or alpha <= 0:
+        return None
+    return alpha, beta, loc
+
+
+def loglogistic_cdf(x: np.ndarray, alpha: float, beta: float, loc: float) -> np.ndarray:
+    z = np.asarray(x, dtype=float) - loc
+    p = np.full(z.shape, EPS)
+    pos = z > 0
+    p[pos] = 1.0 / (1.0 + (alpha / z[pos]) ** beta)
+    return p
+
+
+def compute_spei(precip: pd.Series, pet: pd.Series, timescales: List[int],
+                 calib=None, min_fit: int = 15) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Per calendar month, fit a log-logistic by PWM. If the fit is invalid (beta <= 1,
+    non-positive scale, or a calibration value at/below the fitted lower bound --
+    typical for near-normal long-timescale sums) a normal distribution is used
+    instead and flagged in the diagnostics ('Distribution' column).
+    """
+    D = precip - pet
+    cols, diag_rows = {}, []
+    for sc in timescales:
+        acc = rolling_sum(D, sc)
+        spei = pd.Series(np.nan, index=acc.index)
+        for m in range(1, 13):
+            chunk = acc[acc.index.month == m]
+            fit_data = chunk[calib_mask(chunk.index, calib)].dropna().values
+            diag = dict(Timescale=sc, Month=m, n_fit=len(fit_data), Distribution="none",
+                        alpha=np.nan, beta=np.nan, gamma_loc=np.nan)
+            if len(fit_data) < min_fit:
+                diag_rows.append(diag)
+                continue
+            valid = chunk.dropna()
+            params = fit_loglogistic_pwm(fit_data)
+            if params is not None and fit_data.min() > params[2]:
+                a, b, g = params
+                diag.update(Distribution="log-logistic(PWM)", alpha=a, beta=b, gamma_loc=g)
+                p = loglogistic_cdf(valid.values, a, b, g)
+            else:
+                mu, sd = fit_data.mean(), fit_data.std(ddof=1)
+                diag.update(Distribution="normal_fallback", alpha=sd, beta=np.nan, gamma_loc=mu)
+                p = stats.norm.cdf(valid.values, mu, sd)
+            diag["n_clipped"] = int(((p <= EPS) | (p >= 1 - EPS)).sum())
+            spei.loc[valid.index] = stats.norm.ppf(np.clip(p, EPS, 1 - EPS))
+            diag_rows.append(diag)
+        cols[f"SPEI-{sc}"] = spei
+    diag_df = pd.DataFrame(diag_rows)
+    n_fb = int((diag_df["Distribution"] == "normal_fallback").sum())
+    if n_fb:
+        log.warning("SPEI: %d/%d month x scale fits used the normal fallback (see fit-parameter CSV)",
+                    n_fb, len(diag_df))
+    n_clip = int(diag_df.get("n_clipped", pd.Series(dtype=float)).sum())
+    if n_clip:
+        log.warning("SPEI: %d value(s) hit the probability clip (|SPEI| ~ 4.75): the fitted "
+                    "lower bound sits at the sample minimum. Inspect before reporting extremes.", n_clip)
+    return pd.DataFrame(cols), diag_df
+
+
+# --------------------------------------------------------------------------
+# Classification and statistics (WMO 2012 categories; dry side inclusive)
+# --------------------------------------------------------------------------
+def classify(x: pd.Series) -> pd.Series:
+    conds = [x <= -2.0, x <= -1.5, x <= -1.0, x < 1.0, x < 1.5, x < 2.0]
+    labels = ["Extreme Dry", "Severe Dry", "Moderate Dry", "Near Normal",
+              "Moderate Wet", "Severe Wet"]
+    out = pd.Series(np.select(conds, labels, default="Extreme Wet"), index=x.index, dtype=object)
+    out[x.isna()] = np.nan
+    return out
+
+
+def describe_indices(master: pd.DataFrame, idx_cols: List[str]) -> pd.DataFrame:
+    rows = []
+    for c in idx_cols:
+        s = master[c].dropna()
+        rows.append({
+            "Index": c, "n": len(s), "mean": s.mean(), "std": s.std(), "min": s.min(),
+            "max": s.max(),
+            "pct_extreme_dry(<=-2)": (s <= -2).mean() * 100,
+            "pct_severe_dry(-2,-1.5]": ((s > -2) & (s <= -1.5)).mean() * 100,
+            "pct_moderate_dry(-1.5,-1]": ((s > -1.5) & (s <= -1)).mean() * 100,
+            "pct_any_dry(<=-1)": (s <= -1).mean() * 100,
+        })
+    return pd.DataFrame(rows).set_index("Index").round(3)
+
+
+# --------------------------------------------------------------------------
+# Plotting
+# --------------------------------------------------------------------------
+COLORS = {"SPI": ("#2166AC", "#D73027"), "SPEI": ("#1A9641", "#D73027")}
+
+
+def _bars(ax, s: pd.Series, kind: str):
+    s = s.dropna()
+    pos, neg = COLORS[kind]
+    ax.bar(s.index, s.values, color=[pos if v >= 0 else neg for v in s], width=25, linewidth=0)
+    ax.axhline(0, color="black", lw=0.8)
+    for t, ls in [(-1.0, "--"), (-1.5, ":"), (-2.0, "-.")]:
+        ax.axhline(t, color="red", lw=0.6, ls=ls, alpha=0.6)
+    ax.set_ylim(-3.5, 3.5)
+    ax.grid(axis="y", alpha=0.25)
+
+
+def _fmt_x(ax):
+    ax.xaxis.set_major_locator(mdates.YearLocator(5))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    plt.setp(ax.get_xticklabels(), rotation=45)
+
+
+def plot_single(s, title, kind, path, dpi):
+    fig, ax = plt.subplots(figsize=(14, 4))
+    _bars(ax, s, kind)
+    ax.set_title(title, fontsize=11, fontweight="bold")
+    ax.set_ylabel(kind)
+    _fmt_x(ax)
+    fig.tight_layout()
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_stack(df, kind, lake, outdir, dpi):
+    cols = [c for c in df.columns if c.startswith(kind + "-")]
+    fig, axes = plt.subplots(len(cols), 1, figsize=(16, 3 * len(cols)), sharex=True)
+    for ax, c in zip(np.atleast_1d(axes), cols):
+        _bars(ax, df[c], kind)
+        ax.set_ylabel(c, fontsize=9)
+    np.atleast_1d(axes)[0].set_title(f"{lake} - {kind} (all timescales)", fontweight="bold")
+    _fmt_x(np.atleast_1d(axes)[-1])
+    fig.tight_layout()
+    fig.savefig(outdir / f"{lake}_{kind}_allTimescales.png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
+# --------------------------------------------------------------------------
+# Pipeline
+# --------------------------------------------------------------------------
+def run_lake(lake: str, args) -> pd.DataFrame:
+    log.info("=== %s ===", lake)
+    out = Path(args.output_dir) / lake
+    out.mkdir(parents=True, exist_ok=True)
+    data = Path(args.data_dir)
+
+    precip = load_monthly_csv(data / args.precip_template.format(lake=lake), args.precip_col)
+    pet = load_monthly_csv(data / args.pet_template.format(lake=lake), args.pet_col)
+    idx = precip.index.intersection(pet.index)
+    precip, pet = precip.loc[idx], pet.loc[idx]
+    log.info("Period %s -> %s (%d months)", idx[0].strftime("%Y-%m"), idx[-1].strftime("%Y-%m"), len(idx))
+
+    calib = (args.calib_start, args.calib_end) if args.calib_start and args.calib_end else None
+    spi, ks = compute_spi(precip, args.timescales, calib, args.ks_alpha, args.ks_boot, args.seed)
+    spei, spei_fit = compute_spei(precip, pet, args.timescales, calib)
+
+    n_pass = int(ks["KS_pass"].sum())
+    log.info("SPI gamma KS: %d/%d month x scale fits not rejected (alpha=%.2f; %s p-value)",
+             n_pass, len(ks), args.ks_alpha, "Monte-Carlo" if args.ks_boot > 0 else "naive")
+
+    master = pd.concat([precip.rename("Precip_mm"), pet.rename("PET_mm"),
+                        (precip - pet).rename("D_balance_mm"), spi, spei], axis=1)
+    master.index.name = "Date"
+    idx_cols = list(spi.columns) + list(spei.columns)
+    classes = pd.concat([classify(master[c]).rename(c + "_class") for c in idx_cols], axis=1)
+    tag = f"{idx[0].year}_{idx[-1].year}"
+    pd.concat([master, classes], axis=1).to_csv(out / f"{lake}_SPI_SPEI_{tag}.csv")
+    ks.to_csv(out / f"{lake}_SPI_gamma_fit_diagnostics.csv", index=False)
+    spei_fit.to_csv(out / f"{lake}_SPEI_loglogistic_fit_parameters.csv", index=False)
+    describe_indices(master, idx_cols).to_csv(out / f"{lake}_drought_statistics.csv")
+
+    if not args.no_plots:
+        plot_stack(spi, "SPI", lake, out, args.dpi)
+        plot_stack(spei, "SPEI", lake, out, args.dpi)
+        for sc in args.timescales:
+            plot_single(spi[f"SPI-{sc}"], f"{lake} - SPI-{sc} (gamma)", "SPI",
+                        out / f"{lake}_SPI-{sc}.png", args.dpi)
+            plot_single(spei[f"SPEI-{sc}"], f"{lake} - SPEI-{sc} (log-logistic, PWM)", "SPEI",
+                        out / f"{lake}_SPEI-{sc}.png", args.dpi)
+    return master
+
+
+def compare_plots(results: Dict[str, pd.DataFrame], args):
+    comp = Path(args.output_dir) / "Comparison"
+    comp.mkdir(parents=True, exist_ok=True)
+    for sc in args.timescales:
+        for kind in ("SPI", "SPEI"):
+            col = f"{kind}-{sc}"
+            fig, axes = plt.subplots(len(results), 1, figsize=(16, 3 * len(results)), sharex=True)
+            for ax, (lake, df) in zip(np.atleast_1d(axes), results.items()):
+                _bars(ax, df[col], kind)
+                ax.set_ylabel(f"{lake}\n{col}", fontsize=9)
+            np.atleast_1d(axes)[0].set_title(f"Comparison - {col}", fontweight="bold")
+            _fmt_x(np.atleast_1d(axes)[-1])
+            fig.tight_layout()
+            fig.savefig(comp / f"Compare_{col}.png", dpi=args.dpi, bbox_inches="tight")
+            plt.close(fig)
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--data-dir", default="data")
+    p.add_argument("--output-dir", default="results")
+    p.add_argument("--lakes", nargs="+", default=["Iznik", "Uluabat"])
+    p.add_argument("--precip-template", default="{lake}_Monthly_Precip_1981_2024.csv")
+    p.add_argument("--pet-template", default="{lake}_Monthly_PET_1981_2024.csv")
+    p.add_argument("--precip-col", default="Precipitation_mm")
+    p.add_argument("--pet-col", default="Potential_Evaporation_mm")
+    p.add_argument("--timescales", nargs="+", type=int, default=[1, 3, 6, 12, 24])
+    p.add_argument("--calib-start", type=int, default=None,
+                   help="First year of the calibration (reference) period; default = full record")
+    p.add_argument("--calib-end", type=int, default=None)
+    p.add_argument("--ks-alpha", type=float, default=0.05)
+    p.add_argument("--ks-boot", type=int, default=500,
+                   help="Monte-Carlo replicates for the KS p-value (0 = naive p-value only)")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--dpi", type=int, default=150)
+    p.add_argument("--no-plots", action="store_true")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    args = parse_args(argv)
+    results = {lake: run_lake(lake, args) for lake in args.lakes}
+    if len(results) > 1 and not args.no_plots:
+        compare_plots(results, args)
+    log.info("Done. Results in %s", Path(args.output_dir).resolve())
+
+
+if __name__ == "__main__":
+    main()
